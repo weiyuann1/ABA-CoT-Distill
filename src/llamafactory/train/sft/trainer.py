@@ -31,7 +31,7 @@ from ...extras.constants import IGNORE_INDEX
 from ...extras.packages import is_transformers_version_greater_than
 from ..callbacks import SaveProcessorCallback
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
-
+from transformers.trainer_pt_utils import LabelSmoother
 
 if TYPE_CHECKING:
     from torch.utils.data import Dataset
@@ -104,81 +104,109 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         """
         Override the compute_loss method to give equal weight to the thinking and answer parts.
         """
+        self.label_smoother = LabelSmoother(epsilon=self.args.label_smoothing_factor)
+        labels=inputs.get("labels")
         # Get the original outputs from the model
         outputs = model(**inputs)
+
+        # 保存past state（如果存在）
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
         
-        # If there's no labels, just return the original loss
-        if "labels" not in inputs:
-            loss = outputs.loss
-            return (loss, outputs) if return_outputs else loss
-        
-        # Get the logits and labels
-        logits = outputs.logits
-        labels = inputs["labels"]
+        # 获取logits
+        logits = outputs["logits"] if isinstance(outputs, dict) else outputs[0]
         
         # Get the special token ID for <thinking_end>
         thinking_end_token_id = self.processing_class.convert_tokens_to_ids('<thinking_end>')
         
-        batch_size = labels.shape[0]
+        batch_size, seq_len, vocab_size = logits.shape
         total_loss = 0
-        
+        thinking_loss = 0.0
+        strategy_loss = 0.0
+        thinking_logits=[]
+        strategy_logits=[]
+        thinking_labels=[]
+        strategy_labels=[]
         for i in range(batch_size):
             # Find the position of the special token
-            delimiter_pos = -1
-            for j in range(labels.shape[1]):
-                if labels[i, j] == thinking_end_token_id:
-                    delimiter_pos = j
-                    break
-            
-            # If the delimiter is not found, use the original loss calculation
-            if delimiter_pos == -1:
-                sample_logits = logits[i].unsqueeze(0)
-                sample_labels = labels[i].unsqueeze(0)
-                sample_loss = F.cross_entropy(
-                    sample_logits.view(-1, sample_logits.size(-1)),
-                    sample_labels.view(-1),
-                    ignore_index=IGNORE_INDEX,
-                    reduction='mean'
-                )
-                total_loss += sample_loss
+            thinking_end_positions = (labels[i] == thinking_end_token_id).nonzero(as_tuple=True)[0]
+            print('thinking_end_positions',thinking_end_positions)
+            if len(thinking_end_positions) == 0:
+                # print('!!!! not find thinking part')
+                return super().compute_loss(model, inputs, *args, **kwargs)
             else:
-                # Calculate loss for thinking part
-                thinking_logits = logits[i, :delimiter_pos].unsqueeze(0)
-                thinking_labels = labels[i, :delimiter_pos].unsqueeze(0)
-                thinking_loss = F.cross_entropy(
-                    thinking_logits.view(-1, thinking_logits.size(-1)),
-                    thinking_labels.view(-1),
-                    ignore_index=IGNORE_INDEX,
-                    reduction='sum'
-                )
+                # 找到第一个<thinking_end>位置
+                split_pos = thinking_end_positions[0]
                 
-                # Calculate loss for answer part
-                answer_logits = logits[i, delimiter_pos+1:].unsqueeze(0)  # +1 to skip the delimiter token
-                answer_labels = labels[i, delimiter_pos+1:].unsqueeze(0)
-                answer_loss = F.cross_entropy(
-                    answer_logits.view(-1, answer_logits.size(-1)),
-                    answer_labels.view(-1),
-                    ignore_index=IGNORE_INDEX,
-                    reduction='sum'
-                )
+                # 分割标签和logits为thinking部分和strategy部分
+                thinking_label= labels[i][:split_pos+1]  # 包含<thinking_end>标记
+                strategy_label = labels[i][split_pos:]    # 从<thinking_end>开始
                 
-                # Count valid tokens (non-padding) in each part
-                thinking_valid = (thinking_labels != IGNORE_INDEX).sum().item()
-                answer_valid = (answer_labels != IGNORE_INDEX).sum().item()
-                
-                # Normalize losses by the number of valid tokens
-                if thinking_valid > 0:
-                    thinking_loss = thinking_loss / thinking_valid
-                if answer_valid > 0:
-                    answer_loss = answer_loss / answer_valid
-                
-                # Equal weighting of both parts
-                sample_loss = (thinking_loss + answer_loss) / 2
-                total_loss += sample_loss
+                thinking_logit = logits[i][:split_pos+1]
+                strategy_logit = logits[i][split_pos:]
+
+                thinking_labels.append(thinking_label)
+                strategy_labels.append(strategy_label)
+                thinking_logits.append(thinking_logit)
+                strategy_logits.append(strategy_logit)
+
+        # 处理序列长度不一致的问题
+        max_thinking_len = max(len(label) for label in thinking_labels)
+        max_strategy_len = max(len(label) for label in strategy_labels)
+
+         # 使用padding处理不同长度的序列
+        padded_thinking_labels = []
+        padded_thinking_logits = []
+        padded_strategy_labels = []
+        padded_strategy_logits = []
         
-        # Average the loss over the batch
-        loss = total_loss / batch_size
+        for i in range(len(thinking_labels)):
+            t_label = thinking_labels[i]
+            t_logit = thinking_logits[i]
+            s_label = strategy_labels[i]
+            s_logit = strategy_logits[i]
+            
+            # 填充thinking部分
+            if len(t_label) < max_thinking_len:
+                pad_length = max_thinking_len - len(t_label)
+                padding = torch.full((pad_length,), -100, dtype=t_label.dtype, device=t_label.device)
+                padded_thinking_labels.append(torch.cat([t_label, padding], dim=0))
+                
+                logit_padding = torch.zeros((pad_length, vocab_size), dtype=t_logit.dtype, device=t_logit.device)
+                padded_thinking_logits.append(torch.cat([t_logit, logit_padding], dim=0))
+            else:
+                padded_thinking_labels.append(t_label)
+                padded_thinking_logits.append(t_logit)
+            
+            # 填充strategy部分
+            if len(s_label) < max_strategy_len:
+                pad_length = max_strategy_len - len(s_label)
+                padding = torch.full((pad_length,), -100, dtype=s_label.dtype, device=s_label.device)
+                padded_strategy_labels.append(torch.cat([s_label, padding], dim=0))
+                
+                logit_padding = torch.zeros((pad_length, vocab_size), dtype=s_logit.dtype, device=s_logit.device)
+                padded_strategy_logits.append(torch.cat([s_logit, logit_padding], dim=0))
+            else:
+                padded_strategy_labels.append(s_label)
+                padded_strategy_logits.append(s_logit)
+
+        # 将列表转换为张量
+        padded_thinking_labels = torch.stack(padded_thinking_labels)
+        padded_thinking_logits = torch.stack(padded_thinking_logits)
+        padded_strategy_labels = torch.stack(padded_strategy_labels)
+        padded_strategy_logits = torch.stack(padded_strategy_logits)
+
+        thinking_outputs={"logits": padded_thinking_logits, "labels": padded_thinking_labels}
+        strategy_outputs={"logits": padded_strategy_logits, "labels": padded_strategy_labels}        
         
+
+        thinking_loss = self.label_smoother(thinking_outputs, thinking_outputs['labels'], shift_labels=True)
+        strategy_loss = self.label_smoother(strategy_outputs, strategy_outputs['labels'], shift_labels=True)
+        # thinking_loss = super().compute_loss(model, inputs, outputs=False, *args, **kwargs)      
+        # 两部分权重相同
+        loss = thinking_loss + strategy_loss
+        
+        print(loss.item(),thinking_loss.item(), strategy_loss.item())
         return (loss, outputs) if return_outputs else loss
 
     @override

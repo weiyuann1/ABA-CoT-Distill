@@ -96,6 +96,12 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
     except Exception as e:
         raise OSError("Failed to load tokenizer.") from e
 
+    # Add special token for thinking/answer separation
+    special_tokens_dict = {'additional_special_tokens': ['<thinking_end>']}
+    num_added_tokens = tokenizer.add_special_tokens(special_tokens_dict)
+    if num_added_tokens > 0:
+        logger.info_rank0(f"Added {num_added_tokens} special tokens: {special_tokens_dict}")
+    
     patch_tokenizer(tokenizer, model_args)
     try:
         processor = AutoProcessor.from_pretrained(model_args.model_name_or_path, **init_kwargs)
@@ -175,6 +181,12 @@ def load_model(
         patch_model(model, tokenizer, model_args, is_trainable, add_valuehead)
         register_autoclass(config, model, tokenizer)
 
+    # Resize token embeddings to account for special tokens
+    if not lazy_load and model is not None:
+        if model.get_input_embeddings().num_embeddings != len(tokenizer):
+            logger.info_rank0(f"Resizing token embeddings from {model.get_input_embeddings().num_embeddings} to {len(tokenizer)}")
+            model.resize_token_embeddings(len(tokenizer))
+    
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
 
     if add_valuehead:

@@ -30,6 +30,13 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class SupervisedDatasetProcessor(DatasetProcessor):
+    def _preprocess_response_text(self, text: str) -> str:
+        """
+        Replace the '|||' delimiter with the special token '<thinking_end>' in the response text.
+        """
+        if isinstance(text, str) and "|||" in text:
+            return text.replace("|||", "<thinking_end>")
+        return text
     def _encode_data_example(
         self,
         prompt: list[dict[str, str]],
@@ -40,7 +47,15 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         videos: list["VideoInput"],
         audios: list["AudioInput"],
     ) -> tuple[list[int], list[int]]:
-        messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
+        # Process response to replace "|||" with "<thinking_end>"
+        processed_response = []
+        for msg in response:
+            processed_msg = msg.copy()
+            if msg["role"] == "assistant" and "content" in msg:
+                processed_msg["content"] = self._preprocess_response_text(msg["content"])
+            processed_response.append(processed_msg)
+            
+        messages = self.template.mm_plugin.process_messages(prompt + processed_response, images, videos, audios, self.processor)
         input_ids, labels = self.template.mm_plugin.process_token_ids(
             [], [], images, videos, audios, self.tokenizer, self.processor
         )

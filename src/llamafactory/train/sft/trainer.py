@@ -18,10 +18,11 @@
 import json
 import os
 from types import MethodType
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
@@ -99,8 +100,86 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return super()._get_train_sampler()
 
     @override
-    def compute_loss(self, model, inputs, *args, **kwargs):
-        return super().compute_loss(model, inputs, *args, **kwargs)
+    def compute_loss(self, model, inputs, return_outputs=False, *args, **kwargs):
+        """
+        Override the compute_loss method to give equal weight to the thinking and answer parts.
+        """
+        # Get the original outputs from the model
+        outputs = model(**inputs)
+        
+        # If there's no labels, just return the original loss
+        if "labels" not in inputs:
+            loss = outputs.loss
+            return (loss, outputs) if return_outputs else loss
+        
+        # Get the logits and labels
+        logits = outputs.logits
+        labels = inputs["labels"]
+        
+        # Get the special token ID for <thinking_end>
+        thinking_end_token_id = self.processing_class.convert_tokens_to_ids('<thinking_end>')
+        
+        batch_size = labels.shape[0]
+        total_loss = 0
+        
+        for i in range(batch_size):
+            # Find the position of the special token
+            delimiter_pos = -1
+            for j in range(labels.shape[1]):
+                if labels[i, j] == thinking_end_token_id:
+                    delimiter_pos = j
+                    break
+            
+            # If the delimiter is not found, use the original loss calculation
+            if delimiter_pos == -1:
+                sample_logits = logits[i].unsqueeze(0)
+                sample_labels = labels[i].unsqueeze(0)
+                sample_loss = F.cross_entropy(
+                    sample_logits.view(-1, sample_logits.size(-1)),
+                    sample_labels.view(-1),
+                    ignore_index=IGNORE_INDEX,
+                    reduction='mean'
+                )
+                total_loss += sample_loss
+            else:
+                # Calculate loss for thinking part
+                thinking_logits = logits[i, :delimiter_pos].unsqueeze(0)
+                thinking_labels = labels[i, :delimiter_pos].unsqueeze(0)
+                thinking_loss = F.cross_entropy(
+                    thinking_logits.view(-1, thinking_logits.size(-1)),
+                    thinking_labels.view(-1),
+                    ignore_index=IGNORE_INDEX,
+                    reduction='sum'
+                )
+                
+                # Calculate loss for answer part
+                answer_logits = logits[i, delimiter_pos+1:].unsqueeze(0)  # +1 to skip the delimiter token
+                answer_labels = labels[i, delimiter_pos+1:].unsqueeze(0)
+                answer_loss = F.cross_entropy(
+                    answer_logits.view(-1, answer_logits.size(-1)),
+                    answer_labels.view(-1),
+                    ignore_index=IGNORE_INDEX,
+                    reduction='sum'
+                )
+                
+                # Count valid tokens (non-padding) in each part
+                thinking_valid = (thinking_labels != IGNORE_INDEX).sum().item()
+                answer_valid = (answer_labels != IGNORE_INDEX).sum().item()
+                
+                # Normalize losses by the number of valid tokens
+                if thinking_valid > 0:
+                    thinking_loss = thinking_loss / thinking_valid
+                if answer_valid > 0:
+                    answer_loss = answer_loss / answer_valid
+                
+                # Equal weighting of both parts
+                sample_loss = (thinking_loss + answer_loss) / 2
+                total_loss += sample_loss
+        
+        # Average the loss over the batch
+        loss = total_loss / batch_size
+        
+        return (loss, outputs) if return_outputs else loss
 
     @override
     def prediction_step(
